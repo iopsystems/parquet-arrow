@@ -1,5 +1,10 @@
+#![allow(dead_code)]
+
 use arrow::array::*;
+use arrow::csv::writer::Writer;
 use arrow::datatypes::*;
+use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
+use arrow::ipc::CompressionType;
 use clap::Parser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -78,7 +83,46 @@ fn build_u64_array_column(
     pq_series.push(Arc::new(builder.finish()));
 }
 
-fn generate_parquet(output: &str, compression: bool, listarray: bool) {
+fn write_parquet(output: String, compression: bool, batch: &RecordBatch) {
+    let file = File::create(output).unwrap();
+
+    let props = match compression {
+        false => WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .build(),
+        true => WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+            .build(),
+    };
+
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+}
+
+fn write_ipc(output: String, compression: bool, batch: &RecordBatch) {
+    let file = File::create(output).unwrap();
+
+    let opts = match compression {
+        false => IpcWriteOptions::default(),
+        true => IpcWriteOptions::default()
+            .try_with_compression(Some(CompressionType::ZSTD))
+            .unwrap(),
+    };
+
+    let mut writer = FileWriter::try_new_with_options(file, &batch.schema(), opts).unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+}
+
+fn write_csv(output: String, batch: &RecordBatch) {
+    let file = File::create(output).unwrap();
+    let mut writer = Writer::new(file);
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+}
+
+fn build_arrow(output: &str, compression: bool, listarray: bool) {
     let mut pq_cols: Vec<Field> = Vec::new();
     let mut pq_series: Vec<Arc<dyn Array>> = Vec::new();
 
@@ -107,30 +151,16 @@ fn generate_parquet(output: &str, compression: bool, listarray: bool) {
         build_u64_array_column("arrays", arrays, &mut pq_cols, &mut pq_series);
     }
 
-    let file = File::create(output).unwrap();
     let schema = Schema::new(pq_cols);
     let batch = RecordBatch::try_new(Arc::new(schema), pq_series).unwrap();
 
-    let props = match compression {
-        false => WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .build(),
-        true => WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
-            .build(),
-    };
-
-    eprintln!(
-        "Parquet options: compression {}; listarray: {}",
-        compression, listarray
-    );
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    write_parquet(output.to_owned() + ".parquet", compression, &batch);
+    write_ipc(output.to_owned() + ".ipc", compression, &batch);
+    // write_csv(output.to_owned() + ".csv", &batch);
 }
 
 fn read_parquet(input: &str) {
-    let file = File::open(input).unwrap();
+    let file = File::open(input.to_owned() + ".parquet").unwrap();
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
     let mut reader = builder.build().unwrap();
     let record_batch = reader.next().unwrap().unwrap();
@@ -142,11 +172,13 @@ fn read_parquet(input: &str) {
 
 fn main() {
     let args = CliArgs::parse();
-    let name = "foobar.parquet";
-    generate_parquet(name, args.compression, args.listarray);
+    let name = "foobar";
+    build_arrow(name, args.compression, args.listarray);
     read_parquet(name);
 
     if !args.keepfile {
-        let _ = std::fs::remove_file(name);
+        let _ = std::fs::remove_file(name.to_owned() + ".parquet");
+        let _ = std::fs::remove_file(name.to_owned() + ".ipc");
+        // let _ = std::fs::remove_file(name.to_owned() + ".csv");
     }
 }

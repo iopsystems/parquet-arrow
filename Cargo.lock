@@ -233,6 +233,7 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "flatbuffers",
+ "zstd",
 ]
 
 [[package]]
@@ -877,6 +878,7 @@ name = "parquet-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-ipc",
  "clap",
  "parquet",
  "rand",
