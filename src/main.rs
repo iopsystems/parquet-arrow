@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::needless_return)]
 
 use arrow::array::*;
 use arrow::csv::writer::Writer;
@@ -83,7 +84,14 @@ fn build_u64_array_column(
     pq_series.push(Arc::new(builder.finish()));
 }
 
-fn write_parquet(output: String, compression: bool, batch: &RecordBatch) {
+fn write_parquet(
+    output: String,
+    listarray: bool,
+    compression: bool,
+    schema: SchemaRef,
+    nrows: u8,
+    nbatches: u8,
+) {
     let file = File::create(output).unwrap();
 
     let props = match compression {
@@ -95,12 +103,22 @@ fn write_parquet(output: String, compression: bool, batch: &RecordBatch) {
             .build(),
     };
 
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
-    writer.write(batch).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    for _ in 0..nbatches {
+        let batch = generate_batch(nrows, listarray);
+        writer.write(&batch).unwrap();
+    }
     writer.close().unwrap();
 }
 
-fn write_ipc(output: String, compression: bool, batch: &RecordBatch) {
+fn write_ipc(
+    output: String,
+    listarray: bool,
+    compression: bool,
+    schema: SchemaRef,
+    nrows: u8,
+    nbatches: u8,
+) {
     let file = File::create(output).unwrap();
 
     let opts = match compression {
@@ -110,8 +128,11 @@ fn write_ipc(output: String, compression: bool, batch: &RecordBatch) {
             .unwrap(),
     };
 
-    let mut writer = FileWriter::try_new_with_options(file, &batch.schema(), opts).unwrap();
-    writer.write(batch).unwrap();
+    let mut writer = FileWriter::try_new_with_options(file, &schema, opts).unwrap();
+    for _ in 0..nbatches {
+        let batch = generate_batch(nrows, listarray);
+        writer.write(&batch).unwrap();
+    }
     writer.close().unwrap();
 }
 
@@ -122,17 +143,14 @@ fn write_csv(output: String, batch: &RecordBatch) {
     writer.close().unwrap();
 }
 
-fn build_arrow(output: &str, compression: bool, listarray: bool) {
-    let mut pq_cols: Vec<Field> = Vec::new();
-    let mut pq_series: Vec<Arc<dyn Array>> = Vec::new();
-
+fn generate_data(nrows: u8) -> (Vec<String>, Vec<u64>, Vec<f64>, Vec<Vec<u64>>) {
     let mut rng = rand::thread_rng();
     let mut strings: Vec<String> = Vec::new();
     let mut nums: Vec<u64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     let mut arrays: Vec<Vec<u64>> = Vec::new();
 
-    for _ in 0..10 {
+    for _ in 0..nrows {
         nums.push(rng.gen_range(0..100));
         floats.push(rng.gen_range(0.0..10.0));
         strings.push(STRINGS[rng.gen_range(0..3)].to_owned());
@@ -144,6 +162,15 @@ fn build_arrow(output: &str, compression: bool, listarray: bool) {
         arrays.push(inner);
     }
 
+    return (strings, nums, floats, arrays);
+}
+
+fn generate_batch(nrows: u8, listarray: bool) -> RecordBatch {
+    let mut pq_cols: Vec<Field> = Vec::new();
+    let mut pq_series: Vec<Arc<dyn Array>> = Vec::new();
+
+    let (strings, nums, floats, arrays) = generate_data(nrows);
+
     build_u64_column("nums", nums, &mut pq_cols, &mut pq_series);
     build_f64_column("floats", floats, &mut pq_cols, &mut pq_series);
     build_string_column("strings", strings, &mut pq_cols, &mut pq_series);
@@ -154,8 +181,28 @@ fn build_arrow(output: &str, compression: bool, listarray: bool) {
     let schema = Schema::new(pq_cols);
     let batch = RecordBatch::try_new(Arc::new(schema), pq_series).unwrap();
 
-    write_parquet(output.to_owned() + ".parquet", compression, &batch);
-    write_ipc(output.to_owned() + ".ipc", compression, &batch);
+    return batch;
+}
+
+fn build_arrow(output: &str, nrows: u8, compression: bool, listarray: bool) {
+    let batch = generate_batch(nrows, listarray);
+    write_parquet(
+        output.to_owned() + ".parquet",
+        listarray,
+        compression,
+        batch.schema(),
+        nrows,
+        2,
+    );
+
+    // write_ipc(
+    //     output.to_owned() + ".ipc",
+    //     listarray,
+    //     compression,
+    //     batch.schema(),
+    //     nrows,
+    //     2,
+    // );
     // write_csv(output.to_owned() + ".csv", &batch);
 }
 
@@ -173,12 +220,12 @@ fn read_parquet(input: &str) {
 fn main() {
     let args = CliArgs::parse();
     let name = "foobar";
-    build_arrow(name, args.compression, args.listarray);
+    build_arrow(name, 3, args.compression, args.listarray);
     read_parquet(name);
 
     if !args.keepfile {
         let _ = std::fs::remove_file(name.to_owned() + ".parquet");
-        let _ = std::fs::remove_file(name.to_owned() + ".ipc");
+        // let _ = std::fs::remove_file(name.to_owned() + ".ipc");
         // let _ = std::fs::remove_file(name.to_owned() + ".csv");
     }
 }
