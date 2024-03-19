@@ -12,6 +12,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::*;
 use parquet::file::properties::*;
 use rand::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -35,7 +36,8 @@ fn build_u64_column(
     pq_cols: &mut Vec<Field>,
     pq_series: &mut Vec<Arc<dyn Array>>,
 ) {
-    let field = Field::new(name, DataType::UInt64, false);
+    let h = HashMap::from([("type".to_owned(), "u64".to_owned())]);
+    let field = Field::new(name, DataType::UInt64, false).with_metadata(h);
     let series = Arc::new(UInt64Array::from(data));
     pq_cols.push(field);
     pq_series.push(series);
@@ -47,7 +49,8 @@ fn build_f64_column(
     pq_cols: &mut Vec<Field>,
     pq_series: &mut Vec<Arc<dyn Array>>,
 ) {
-    let field = Field::new(name, DataType::Float64, false);
+    let h = HashMap::from([("type".to_owned(), "f64".to_owned())]);
+    let field = Field::new(name, DataType::Float64, false).with_metadata(h);
     let series = Arc::new(Float64Array::from(data));
     pq_cols.push(field);
     pq_series.push(series);
@@ -59,7 +62,8 @@ fn build_string_column(
     pq_cols: &mut Vec<Field>,
     pq_series: &mut Vec<Arc<dyn Array>>,
 ) {
-    let field = Field::new(name, DataType::Utf8, false);
+    let h = HashMap::from([("type".to_owned(), "string".to_owned())]);
+    let field = Field::new(name, DataType::Utf8, false).with_metadata(h);
     let series = Arc::new(StringArray::from(data));
     pq_cols.push(field);
     pq_series.push(series);
@@ -71,8 +75,10 @@ fn build_u64_array_column(
     pq_cols: &mut Vec<Field>,
     pq_series: &mut Vec<Arc<dyn Array>>,
 ) {
+    let h = HashMap::from([("type".to_owned(), "u64_array".to_owned())]);
     let mut builder = ListBuilder::new(UInt64Builder::new());
-    let field = Field::new(name, DataType::new_list(DataType::UInt64, true), false);
+    let field =
+        Field::new(name, DataType::new_list(DataType::UInt64, true), false).with_metadata(h);
     for inner in data {
         builder.append_value(inner.iter().map(|x| Some(*x)).collect::<Vec<_>>());
     }
