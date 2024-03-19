@@ -72,11 +72,7 @@ fn build_u64_array_column(
     pq_series: &mut Vec<Arc<dyn Array>>,
 ) {
     let mut builder = ListBuilder::new(UInt64Builder::new());
-    let field = Field::new(
-        name,
-        DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
-        false,
-    );
+    let field = Field::new(name, DataType::new_list(DataType::UInt64, true), false);
     for inner in data {
         builder.append_value(inner.iter().map(|x| Some(*x)).collect::<Vec<_>>());
     }
