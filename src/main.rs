@@ -4,6 +4,7 @@
 use arrow::array::*;
 use arrow::csv::writer::Writer;
 use arrow::datatypes::*;
+use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow::ipc::CompressionType;
 use clap::{Parser, Subcommand};
@@ -265,6 +266,11 @@ fn read_parquet(input: &str) {
     }
 }
 
+fn read_ipc_schema(input: &str) -> SchemaRef {
+    let reader = FileReader::try_new(File::open(input).unwrap(), None).unwrap();
+    return reader.schema();
+}
+
 fn main() {
     let args = CliArgs::parse();
 
@@ -284,8 +290,13 @@ fn main() {
             }
         }
         Commands::Schema { input_file } => {
-            let batch = read_parquet_batch(input_file);
-            let schema = batch.schema();
+            let schema = match input_file.ends_with(".parquet") {
+                true => {
+                    let batch = read_parquet_batch(input_file);
+                    batch.schema()
+                },
+                false => read_ipc_schema(input_file),
+            };
             for f in schema.fields() {
                 println!("{}. {:#?}, {:#?}", f.name(), f.data_type(), f.metadata());
             }
