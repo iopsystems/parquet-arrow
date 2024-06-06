@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::*;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::*;
 use rand::*;
 use std::collections::HashMap;
@@ -33,6 +34,10 @@ enum Commands {
         keepfile: bool,
     },
     Schema {
+        #[arg(short, long)]
+        input_file: String,
+    },
+    Metadata {
         #[arg(short, long)]
         input_file: String,
     },
@@ -266,9 +271,21 @@ fn read_parquet(input: &str) {
     }
 }
 
+fn read_parquet_schema(input: &str) -> SchemaRef {
+    let file = File::open(input).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    return builder.schema().clone();
+}
+
 fn read_ipc_schema(input: &str) -> SchemaRef {
     let reader = FileReader::try_new(File::open(input).unwrap(), None).unwrap();
     return reader.schema();
+}
+
+fn read_parquet_metadata(input: &str) -> Arc<ParquetMetaData> {
+    let file = File::open(input).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    return builder.metadata().clone();
 }
 
 fn main() {
@@ -291,16 +308,24 @@ fn main() {
         }
         Commands::Schema { input_file } => {
             let schema = match input_file.ends_with(".parquet") {
-                true => {
-                    let batch = read_parquet_batch(input_file);
-                    batch.schema()
-                },
+                true => read_parquet_schema(input_file),
                 false => read_ipc_schema(input_file),
             };
             for f in schema.fields() {
                 println!("{}. {:#?}, {:#?}", f.name(), f.data_type(), f.metadata());
             }
         }
+        Commands::Metadata { input_file } => {
+            let metadata = match input_file.ends_with(".parquet") {
+                true => Some(read_parquet_metadata(input_file)),
+                false => None,
+            };
+            if let Some(x) = metadata {
+                println!("{:#?}", x);
+                println!("Num of row groups: {}", x.row_groups().len());
+                println!("Row group: {:#?}", x.row_group(0).num_rows());
+            }
+        },
         Commands::Convert {
             input_file,
             compression,
