@@ -288,6 +288,11 @@ fn read_parquet_metadata(input: &str) -> Arc<ParquetMetaData> {
     return builder.metadata().clone();
 }
 
+fn read_ipc_metadata(input: &str) -> HashMap<String, String> {
+    let reader = FileReader::try_new(File::open(input).unwrap(), None).unwrap();
+    return reader.custom_metadata().clone();
+}
+
 fn main() {
     let args = CliArgs::parse();
 
@@ -316,16 +321,26 @@ fn main() {
             }
         }
         Commands::Metadata { input_file } => {
-            let metadata = match input_file.ends_with(".parquet") {
-                true => Some(read_parquet_metadata(input_file)),
-                false => None,
+            match input_file.ends_with(".parquet") {
+                true => {
+                    let x = read_parquet_metadata(input_file);
+                    let m: Vec<_> = x
+                        .file_metadata()
+                        .key_value_metadata()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|x| !x.key.starts_with("ARROW"))
+                        .collect();
+                    println!("{:#?}", m);
+                    println!("Num of row groups: {}", x.row_groups().len());
+                    println!("Row group: {:#?}", x.row_group(0).num_rows());
+                }
+                false => {
+                    let x = read_ipc_metadata(input_file);
+                    println!("{:#?}", x);
+                }
             };
-            if let Some(x) = metadata {
-                println!("{:#?}", x);
-                println!("Num of row groups: {}", x.row_groups().len());
-                println!("Row group: {:#?}", x.row_group(0).num_rows());
-            }
-        },
+        }
         Commands::Convert {
             input_file,
             compression,
