@@ -36,6 +36,12 @@ enum Commands {
     Schema {
         #[arg(short, long)]
         input_file: String,
+
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        #[arg(short, long)]
+        tag_filter: Option<bool>,
     },
     Metadata {
         #[arg(short, long)]
@@ -311,12 +317,24 @@ fn main() {
                 let _ = std::fs::remove_file(name.to_owned() + ".parquet");
             }
         }
-        Commands::Schema { input_file } => {
+        Commands::Schema { input_file, filter, tag_filter } => {
             let schema = match input_file.ends_with(".parquet") {
                 true => read_parquet_schema(input_file),
                 false => read_ipc_schema(input_file),
             };
+            let tf = tag_filter.unwrap_or_default();
             for f in schema.fields() {
+                if let Some(x) = filter {
+                    let name = if tf {
+                        f.metadata().get("metric").cloned().unwrap_or_default()
+                    } else {
+                        f.name().clone()
+                    };
+
+                    if !name.starts_with(x) {
+                        continue;
+                    }
+                }
                 println!("{}. {:#?}, {:#?}", f.name(), f.data_type(), f.metadata());
             }
         }
@@ -328,7 +346,7 @@ fn main() {
                         .file_metadata()
                         .key_value_metadata()
                         .unwrap()
-                        .into_iter()
+                        .iter()
                         .filter(|x| !x.key.starts_with("ARROW"))
                         .collect();
                     println!("{:#?}", m);
