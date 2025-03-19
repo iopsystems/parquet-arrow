@@ -27,3 +27,8 @@ the following code will only show fields which start with "cpu"
 
 For parquet files which have opaque column names, the --tag-filter flag
 searches for prefixes in the field metadata rather than using the column name.
+
+To write the schema out into a JSON file use the -o flag:
+```sh
+    parquet-arrow schema -i <FILENAME> -o schema.json
+```

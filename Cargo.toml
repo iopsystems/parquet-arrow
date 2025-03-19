@@ -7,7 +7,9 @@ edition = "2021"
 
 [dependencies]
 arrow-ipc = { version = "54.2.1", features = ["zstd"] }
+arrow-schema = { version = "54.2.1", features = ["serde"] }
 arrow = "54.2.1"
 clap = { version = "4.5.1", features = ["derive"] }
 parquet = "54.2.1"
 rand = "0.8.5"
+serde_json = "1.0.140"

@@ -42,6 +42,9 @@ enum Commands {
 
         #[arg(short, long)]
         tag_filter: Option<bool>,
+
+        #[arg(short, long)]
+        output_file: Option<String>,
     },
     Metadata {
         #[arg(short, long)]
@@ -53,6 +56,10 @@ enum Commands {
 
         #[arg(short, long)]
         compression: bool,
+    },
+    Add {
+        #[arg(short, long)]
+        input_file: String,
     },
 }
 
@@ -317,7 +324,7 @@ fn main() {
                 let _ = std::fs::remove_file(name.to_owned() + ".parquet");
             }
         }
-        Commands::Schema { input_file, filter, tag_filter } => {
+        Commands::Schema { input_file, filter, tag_filter, output_file } => {
             let schema = match input_file.ends_with(".parquet") {
                 true => read_parquet_schema(input_file),
                 false => read_ipc_schema(input_file),
@@ -336,6 +343,15 @@ fn main() {
                     }
                 }
                 println!("{}. {:#?}, {:#?}", f.name(), f.data_type(), f.metadata());
+            }
+
+            if let Some(op_file) = output_file {
+                println!("Writing schema to {}", &op_file);
+                let cloned = (*schema).clone();
+                let json = serde_json::to_string(&cloned).unwrap();
+                if let Err(e) = std::fs::write(op_file, json) {
+                    println!("Error writing schema: {}", e);
+                }
             }
         }
         Commands::Metadata { input_file } => {
@@ -366,6 +382,33 @@ fn main() {
             let output = input_file.to_owned() + ".arrow";
             let batch = read_parquet_batch(input_file);
             write_ipc(output, *compression, &batch);
-        }
+        },
+        Commands::Add { input_file } => {
+            let output = "/home/mihirn/Downloads/foo_meta.parquet";
+            let schema = read_parquet_schema(input_file);
+            let batch = read_parquet_batch(input_file);
+            let metadata: HashMap<&str, &str> = [
+                ("grouping_power", "3"),
+                ("max_value_power", "64"),
+                ("op", "read"),
+                ("metric", "syscall_latency"),
+                ("unit", "nanoseconds"),
+                ("metric_type", "histogram"),
+            ].into();
+            let m2: HashMap<String, String> = metadata.into_iter().map(|(k, v)|(k.to_string(), v.to_string())).collect();
+
+            let nf = schema.field(0).clone().with_metadata(m2);
+            let s = Schema::new(vec![nf]);
+            dbg!("{}", &s);
+
+            let file = File::create(output).unwrap();
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+                .build();
+
+            let mut writer = ArrowWriter::try_new(file, Arc::new(s), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        },
     }
 }
