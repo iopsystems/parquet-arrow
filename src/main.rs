@@ -14,8 +14,9 @@ use parquet::basic::*;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::*;
 use rand::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
+use std::process::exit;
 use std::sync::Arc;
 
 #[derive(Subcommand)]
@@ -58,6 +59,10 @@ enum Commands {
         compression: bool,
     },
     Add {
+        #[arg(short, long)]
+        input_file: String,
+    },
+    Validate {
         #[arg(short, long)]
         input_file: String,
     },
@@ -324,7 +329,12 @@ fn main() {
                 let _ = std::fs::remove_file(name.to_owned() + ".parquet");
             }
         }
-        Commands::Schema { input_file, filter, tag_filter, output_file } => {
+        Commands::Schema {
+            input_file,
+            filter,
+            tag_filter,
+            output_file,
+        } => {
             let schema = match input_file.ends_with(".parquet") {
                 true => read_parquet_schema(input_file),
                 false => read_ipc_schema(input_file),
@@ -382,7 +392,7 @@ fn main() {
             let output = input_file.to_owned() + ".arrow";
             let batch = read_parquet_batch(input_file);
             write_ipc(output, *compression, &batch);
-        },
+        }
         Commands::Add { input_file } => {
             let output = "/home/mihirn/Downloads/foo_meta.parquet";
             let schema = read_parquet_schema(input_file);
@@ -394,8 +404,12 @@ fn main() {
                 ("metric", "syscall_latency"),
                 ("unit", "nanoseconds"),
                 ("metric_type", "histogram"),
-            ].into();
-            let m2: HashMap<String, String> = metadata.into_iter().map(|(k, v)|(k.to_string(), v.to_string())).collect();
+            ]
+            .into();
+            let m2: HashMap<String, String> = metadata
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
 
             let nf = schema.field(0).clone().with_metadata(m2);
             let s = Schema::new(vec![nf]);
@@ -409,6 +423,53 @@ fn main() {
             let mut writer = ArrowWriter::try_new(file, Arc::new(s), Some(props)).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
-        },
+        }
+        Commands::Validate { input_file } => {
+            let file = File::open(input_file).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let schema = builder.schema().clone();
+            let counters: BTreeSet<String> = schema
+                .fields()
+                .iter()
+                .filter(|f| f.metadata().get("metric_type") == Some(&"delta_counter".to_string()))
+                .map(|f| f.name().clone())
+                .collect();
+
+            let reader = builder.build().unwrap();
+            reader.for_each(|batch| match batch {
+                Ok(b) => {
+                    b.columns().iter().zip(schema.fields()).for_each(|(c, f)| {
+                        if counters.contains(f.name()) {
+                            eprintln!("Validating {}", f.name());
+
+                            if *c.data_type() != DataType::Float64 {
+                                eprintln!("Invalid data type for {}", f.name());
+                                exit(-1);
+                            }
+
+                            let values = c
+                                .as_any()
+                                .downcast_ref::<Float64Array>()
+                                .expect("Failed to downcast");
+
+                            for (i, v) in values.iter().enumerate() {
+                                if let Some(x) = v {
+                                    if x < 0.0 {
+                                        eprintln!(
+                                            "Negative value found in {}, row {}",
+                                            f.name(),
+                                            i
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Error reading batch: {}", &e);
+                }
+            });
+        }
     }
 }
