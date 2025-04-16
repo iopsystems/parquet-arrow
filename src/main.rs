@@ -66,6 +66,16 @@ enum Commands {
         #[arg(short, long)]
         input_file: String,
     },
+    Compare {
+        #[arg(short, long)]
+        left: String,
+
+        #[arg(short, long)]
+        right: String,
+
+        #[arg(short, long)]
+        column: String,
+    },
 }
 
 #[derive(Parser)]
@@ -440,8 +450,6 @@ fn main() {
                 Ok(b) => {
                     b.columns().iter().zip(schema.fields()).for_each(|(c, f)| {
                         if counters.contains(f.name()) {
-                            eprintln!("Validating {}", f.name());
-
                             if *c.data_type() != DataType::Float64 {
                                 eprintln!("Invalid data type for {}", f.name());
                                 exit(-1);
@@ -469,6 +477,77 @@ fn main() {
                 Err(e) => {
                     eprintln!("Error reading batch: {}", &e);
                 }
+            });
+        }
+        Commands::Compare {
+            left,
+            right,
+            column,
+        } => {
+            let f1 = File::open(left).unwrap();
+            let f2 = File::open(right).unwrap();
+            let b1 = ParquetRecordBatchReaderBuilder::try_new(f1).unwrap();
+            let b2 = ParquetRecordBatchReaderBuilder::try_new(f2).unwrap();
+
+            if b1.schema().field_with_name(column).is_err() {
+                eprintln!("Column {} does not exist in {}", column, left);
+                exit(-1);
+            }
+
+            if b2.schema().field_with_name(column).is_err() {
+                eprintln!("Column {} does not exist in {}", column, left);
+                exit(-1);
+            }
+
+            let r1 = b1.build().unwrap();
+            let r2 = b2.build().unwrap();
+            r1.into_iter().zip(r2).for_each(|(x, y)| {
+                if x.is_err() {
+                    eprintln!(
+                        "Error reading next recordbatch from {}: {}",
+                        left,
+                        x.unwrap_err()
+                    );
+                    exit(-1);
+                }
+
+                if y.is_err() {
+                    eprintln!(
+                        "Error reading next recordbatch from {}: {}",
+                        right,
+                        y.unwrap_err()
+                    );
+                    exit(-1);
+                }
+
+                let (x, y) = (x.unwrap(), y.unwrap());
+                let l = x.column_by_name(column).unwrap();
+                let r = y.column_by_name(column).unwrap();
+
+                if *l.data_type() != *r.data_type() {
+                    eprintln!(
+                        "Data type mismatch: {} and {}",
+                        *l.data_type(),
+                        *r.data_type()
+                    );
+                    exit(-1);
+                }
+
+                let v1 = l
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Failed to downcast");
+
+                let v2 = r
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Failed to downcast");
+
+                v1.into_iter().zip(v2).enumerate().for_each(|(i, (x, y))| {
+                    if x != y {
+                        eprintln!("Values mismatch for row {}: {:#?} vs {:#?}", i, x, y);
+                    }
+                });
             });
         }
     }
