@@ -45,7 +45,7 @@ Options:
   -h, --help                     Print help
 ```
 
-## Validate
+## Compare
 
 Compares values from a single column from two different parquet files. Assumes
 that the columns are `double` values.
