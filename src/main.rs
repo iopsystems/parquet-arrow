@@ -14,6 +14,7 @@ use parquet::basic::*;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::*;
 use rand::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::process::exit;
@@ -75,6 +76,13 @@ enum Commands {
 
         #[arg(short, long)]
         column: String,
+    },
+    Cgroup {
+        #[arg(short, long)]
+        input_file: String,
+
+        #[arg(short, long)]
+        name_file: String,
     },
 }
 
@@ -549,6 +557,78 @@ fn main() {
                     }
                 });
             });
+        }
+        Commands::Cgroup {
+            input_file,
+            name_file,
+        } => {
+            #[derive(Debug, Serialize, Deserialize)]
+            struct Record {
+                cgroup: String,
+                id_1: String,
+                id_2: String,
+            }
+
+            let mut mappings: Vec<Record> = Vec::new();
+            let mut names = csv::Reader::from_path(name_file).unwrap();
+            for record in names.deserialize() {
+                let data: Record = record.unwrap();
+                mappings.push(data);
+            }
+            // dbg!("{}", &mappings);
+
+            let file = File::open(input_file).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let schema = builder.schema().clone();
+            let mut fields: Vec<Field> = Vec::new();
+
+            for f in schema.fields() {
+                let mut cf = (*(*f).clone()).clone();
+                let meta = cf.metadata();
+
+                let Some(metric) = meta.get("metric") else {
+                    fields.push(cf);
+                    continue;
+                };
+
+                if !metric.starts_with("cgroup") {
+                    fields.push(cf);
+                    continue;
+                }
+
+                let Some(name) = meta.get("name") else {
+                    fields.push(cf);
+                    continue;
+                };
+
+                for r in &mappings {
+                    // Assume only a single match
+                    if name.contains(&r.cgroup) {
+                        let mut nm = meta.clone();
+                        nm.insert("id_1".to_string(), r.id_1.clone());
+                        nm.insert("id_2".to_string(), r.id_2.clone());
+                        cf = cf.with_metadata(nm);
+                        fields.push(cf);
+                        break;
+                    }
+                }
+            }
+
+            // Build new schema
+            let mut builder = SchemaBuilder::new();
+            let meta = builder.metadata_mut();
+            schema.metadata().iter().for_each(|(k, v)| {
+                meta.insert(k.to_string(), v.to_string());
+            });
+            fields.into_iter().for_each(|f| builder.push(f));
+            let s = builder.finish();
+
+            let op_file = "mod_meta.json";
+            println!("Writing schema to {}", &op_file);
+            let json = serde_json::to_string(&s).unwrap();
+            if let Err(e) = std::fs::write(op_file, json) {
+                println!("Error writing schema: {}", e);
+            }
         }
     }
 }
