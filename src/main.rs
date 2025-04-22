@@ -1,88 +1,73 @@
-#![allow(dead_code)]
 #![allow(clippy::needless_return)]
 
-use arrow::array::*;
-use arrow::csv::writer::Writer;
-use arrow::datatypes::*;
-use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
-use arrow::ipc::CompressionType;
+use arrow_array::{Float64Array, Int64Array, PrimitiveArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::{Parser, Subcommand};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::*;
-use parquet::file::metadata::ParquetMetaData;
-use parquet::file::properties::*;
-use rand::*;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::ZstdLevel;
+use parquet::file::{metadata::ParquetMetaData, properties::WriterProperties};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::error::Error;
 use std::fs::File;
-use std::process::exit;
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Subcommand)]
 enum Commands {
-    Generate {
-        #[arg(short, long)]
-        compression: bool,
-
-        #[arg(short, long)]
-        list: bool,
-
-        #[arg(short, long)]
-        array: bool,
-
-        #[arg(short, long)]
-        keepfile: bool,
-    },
+    /// Schema and metadata for the parquet file
     Schema {
         #[arg(short, long)]
-        input_file: String,
+        input: String,
 
         #[arg(short, long)]
         filter: Option<String>,
 
         #[arg(short, long)]
-        tag_filter: Option<bool>,
+        output: Option<String>,
+    },
+    /// Row group information: number and size of row groups
+    RowGroupInfo {
+        #[arg(short, long)]
+        input: String,
+    },
+    /// Compare parquet schemas
+    CompareSchema {
+        #[arg(short, long)]
+        left: String,
 
         #[arg(short, long)]
-        output_file: Option<String>,
+        right: String,
     },
-    Metadata {
-        #[arg(short, long)]
-        input_file: String,
-    },
-    Convert {
-        #[arg(short, long)]
-        input_file: String,
-
-        #[arg(short, long)]
-        compression: bool,
-    },
-    Add {
-        #[arg(short, long)]
-        input_file: String,
-    },
-    Validate {
-        #[arg(short, long)]
-        input_file: String,
-    },
+    /// Compare parquet data
     Compare {
         #[arg(short, long)]
         left: String,
 
         #[arg(short, long)]
         right: String,
-
-        #[arg(short, long)]
-        column: String,
     },
+    /// Validate delta counters in a postprocessd parquet file
+    Validate {
+        #[arg(short, long)]
+        input: String,
+    },
+    /// Augment file with additional metadata around cgroups
     Cgroup {
         #[arg(short, long)]
-        input_file: String,
+        input: String,
 
         #[arg(short, long)]
-        name_file: String,
+        metadata: String,
+
+        #[arg(short, long)]
+        output: String,
+
+        #[arg(long)]
+        tag_1: Option<String>,
+
+        #[arg(long)]
+        tag_2: Option<String>,
     },
 }
 
@@ -92,543 +77,350 @@ struct CliArgs {
     command: Commands,
 }
 
-const STRINGS: &[&str] = &["foo", "bar", "baz"];
-
-fn build_u64_column(
-    name: &str,
-    data: Vec<u64>,
-    pq_cols: &mut Vec<Field>,
-    pq_series: &mut Vec<Arc<dyn Array>>,
-) {
-    let h = HashMap::from([("type".to_owned(), "u64".to_owned())]);
-    let field = Field::new(name, DataType::UInt64, false).with_metadata(h);
-    let series = Arc::new(UInt64Array::from(data));
-    pq_cols.push(field);
-    pq_series.push(series);
+fn read_parquet_footer(
+    input: impl AsRef<Path>,
+) -> Result<(Arc<ParquetMetaData>, SchemaRef, ParquetRecordBatchReader), Box<dyn Error>> {
+    let file = File::open(input)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let metadata = builder.metadata().clone();
+    let schema = builder.schema().clone();
+    let reader = builder.build()?;
+    return Ok((metadata, schema, reader));
 }
 
-fn build_f64_column(
-    name: &str,
-    data: Vec<f64>,
-    pq_cols: &mut Vec<Field>,
-    pq_series: &mut Vec<Arc<dyn Array>>,
-) {
-    let h = HashMap::from([("type".to_owned(), "f64".to_owned())]);
-    let field = Field::new(name, DataType::Float64, false).with_metadata(h);
-    let series = Arc::new(Float64Array::from(data));
-    pq_cols.push(field);
-    pq_series.push(series);
-}
-
-fn build_string_column(
-    name: &str,
-    data: Vec<String>,
-    pq_cols: &mut Vec<Field>,
-    pq_series: &mut Vec<Arc<dyn Array>>,
-) {
-    let h = HashMap::from([("type".to_owned(), "string".to_owned())]);
-    let field = Field::new(name, DataType::Utf8, false).with_metadata(h);
-    let series = Arc::new(StringArray::from(data));
-    pq_cols.push(field);
-    pq_series.push(series);
-}
-
-fn build_u64_list_column(
-    name: &str,
-    data: Vec<Vec<u64>>,
-    pq_cols: &mut Vec<Field>,
-    pq_series: &mut Vec<Arc<dyn Array>>,
-) {
-    let h = HashMap::from([("type".to_owned(), "u64_array".to_owned())]);
-    let mut builder = ListBuilder::new(UInt64Builder::new());
-    let field =
-        Field::new(name, DataType::new_list(DataType::UInt64, true), false).with_metadata(h);
-    for inner in data {
-        builder.append_value(inner.iter().map(|x| Some(*x)).collect::<Vec<_>>());
+fn compare_fields(x: &Field, y: &Field) {
+    if x.data_type() != y.data_type() {
+        eprintln!(
+            "Differing data type for {}: {} vs {}",
+            x.name(),
+            x.data_type(),
+            y.data_type()
+        );
     }
-    pq_cols.push(field);
-    pq_series.push(Arc::new(builder.finish()));
-}
 
-fn build_u64_array_column(
-    name: &str,
-    data: Vec<Vec<u64>>,
-    pq_cols: &mut Vec<Field>,
-    pq_series: &mut Vec<Arc<dyn Array>>,
-) {
-    let h = HashMap::from([("type".to_owned(), "u64_array".to_owned())]);
-    let mut builder = FixedSizeListBuilder::new(UInt64Builder::new(), 3);
-    let field = Field::new(
-        name,
-        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt64, true)), 3),
-        false,
-    )
-    .with_metadata(h);
+    // Compare metadata
+    let (meta1, meta2) = (x.metadata(), y.metadata());
 
-    for inner in data {
-        builder.values().append_slice(&inner);
-        builder.append(true);
-    }
-    pq_cols.push(field);
-    pq_series.push(Arc::new(builder.finish()));
-}
-
-fn write_parquet(
-    output: String,
-    list: bool,
-    array: bool,
-    compression: bool,
-    schema: SchemaRef,
-    nrows: u8,
-    nbatches: u8,
-) {
-    let file = File::create(output).unwrap();
-
-    let props = match compression {
-        false => WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .build(),
-        true => WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
-            .build(),
-    };
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
-    for _ in 0..nbatches {
-        let batch = generate_batch(nrows, list, array);
-        writer.write(&batch).unwrap();
-    }
-    writer.close().unwrap();
-}
-
-fn write_ipc(output: String, compression: bool, batch: &RecordBatch) {
-    let file = File::create(output).unwrap();
-
-    let opts = match compression {
-        false => IpcWriteOptions::default(),
-        true => IpcWriteOptions::default()
-            .try_with_compression(Some(CompressionType::ZSTD))
-            .unwrap(),
-    };
-
-    let mut writer = FileWriter::try_new_with_options(file, &batch.schema(), opts).unwrap();
-    writer.write(batch).unwrap();
-    writer.close().unwrap();
-}
-
-fn write_csv(output: String, batch: &RecordBatch) {
-    let file = File::create(output).unwrap();
-    let mut writer = Writer::new(file);
-    writer.write(batch).unwrap();
-    writer.close().unwrap();
-}
-
-fn generate_data(
-    nrows: u8,
-) -> (
-    Vec<String>,
-    Vec<u64>,
-    Vec<f64>,
-    Vec<Vec<u64>>,
-    Vec<Vec<u64>>,
-) {
-    let mut rng = rand::thread_rng();
-    let mut strings: Vec<String> = Vec::new();
-    let mut nums: Vec<u64> = Vec::new();
-    let mut floats: Vec<f64> = Vec::new();
-    let mut lists: Vec<Vec<u64>> = Vec::new();
-    let mut arrays: Vec<Vec<u64>> = Vec::new();
-
-    for _ in 0..nrows {
-        nums.push(rng.gen_range(0..100));
-        floats.push(rng.gen_range(0.0..10.0));
-        strings.push(STRINGS[rng.gen_range(0..3)].to_owned());
-
-        let mut inner: Vec<u64> = vec![0; 3];
-        for j in 0..3 {
-            inner[j] = rng.gen_range(0..25);
+    // Compare left to right
+    meta1.iter().for_each(|(k, v)| {
+        if meta2.get(k) != Some(v) {
+            let v2 = if let Some(s) = meta2.get(k) {
+                s
+            } else {
+                &"None".to_string()
+            };
+            eprintln!("Mismatch in {}; key {k}: {v} vs {v2}", x.name());
         }
-        lists.push(inner.clone());
-        arrays.push(inner);
+    });
+
+    // Compare right to left: only for missing keys
+    meta2.iter().for_each(|(k, v)| {
+        if !meta1.contains_key(k) {
+            eprintln!("Mismatch in {}; key {k}: None vs {v}", x.name());
+        }
+    });
+}
+
+fn compare_column<T: arrow_array::ArrowPrimitiveType>(
+    column: &str,
+    v1: &PrimitiveArray<T>,
+    v2: &PrimitiveArray<T>,
+) where
+    <T as arrow_array::ArrowPrimitiveType>::Native: std::fmt::Display,
+{
+    v1.into_iter().zip(v2).enumerate().for_each(|(i, (x, y))| {
+        if x != y {
+            let x_str = x
+                .map(|_| v1.value(i).to_string())
+                .unwrap_or("None".to_string());
+            let y_str = y
+                .map(|_| v2.value(i).to_string())
+                .unwrap_or("None".to_string());
+            eprintln!(
+                "Values mismatch for {column}; row {}: {} vs {}",
+                i, x_str, y_str
+            );
+        }
+    });
+}
+
+fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
+    match cmd {
+        Commands::Schema {
+            input,
+            filter,
+            output,
+        } => {
+            let (_, schema, _) = read_parquet_footer(&input)?;
+
+            // If a filter is specified, select only those fields whose
+            // name, as specified by the metric key of the metadata, matches
+            // the filter pattern. This will only work with Rezolus v5
+            // metrics, since the column name is no longer consider meaningful.
+            let json = if let Some(pat) = filter {
+                let fields: Vec<&Arc<Field>> = schema
+                    .fields()
+                    .iter()
+                    .filter(|f| {
+                        f.metadata()
+                            .get("metric")
+                            .cloned()
+                            .unwrap_or_default()
+                            .starts_with(&pat)
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&fields)
+            } else {
+                serde_json::to_string_pretty(&schema)
+            }?;
+            println!("{json}");
+
+            if let Some(op) = output {
+                let json = serde_json::to_string(&schema)?;
+                let res = std::fs::write(&op, json);
+                if let Err(e) = res {
+                    eprintln!("Error writing schema: {e}");
+                } else {
+                    println!("Schema written to {}", &op);
+                }
+            }
+        }
+        Commands::RowGroupInfo { input } => {
+            let (metadata, _, _) = read_parquet_footer(&input)?;
+            println!("Num of row groups: {}", metadata.row_groups().len());
+            println!(
+                "Rows in first group: {:#?}",
+                metadata.row_group(0).num_rows()
+            );
+        }
+        Commands::CompareSchema { left, right } => {
+            let (_, s1, _) = read_parquet_footer(&left)?;
+            let (_, s2, _) = read_parquet_footer(&right)?;
+
+            if s1.fields().len() != s2.fields().len() {
+                eprintln!(
+                    "Differing field counts: {} vs {}",
+                    s1.fields().len(),
+                    s2.fields().len()
+                );
+            }
+
+            // Compare fields from left with right
+            for f1 in s1.fields() {
+                let Ok(f2) = s2.field_with_name(f1.name()) else {
+                    eprintln!("Field {} missing in {right}", f1.name());
+                    continue;
+                };
+
+                compare_fields(f1, f2);
+            }
+
+            // Look for any leftover uncompared fields from the right
+            for f2 in s2.fields() {
+                if s1.field_with_name(f2.name()).is_ok() {
+                    continue;
+                }
+
+                eprintln!("Field {} missing in {left}", f2.name());
+            }
+        }
+        Commands::Compare { left, right } => {
+            let (_, s1, r1) = read_parquet_footer(&left)?;
+            let (_, s2, mut r2) = read_parquet_footer(&right)?;
+
+            // Iterate across record batch from left
+            for x in r1 {
+                let x = x?;
+                let Some(y) = r2.next() else {
+                    let e = format!("{} iterator completed earlier", right);
+                    return Err(e.into());
+                };
+                let y = y?;
+
+                // Map every column from left to the corresponding column on right
+                for (idx, l) in x.columns().iter().enumerate() {
+                    let column = s1.field(idx).name();
+                    let Some(r) = y.column_by_name(column) else {
+                        eprintln!("{column} missing in {right}");
+                        continue;
+                    };
+
+                    let (d1, d2) = (l.data_type(), r.data_type());
+                    if d1 != d2 {
+                        let e = format!("Data type mismatch for {}: {} vs {}", column, d1, d2);
+                        return Err(e.into());
+                    }
+
+                    if *d1 == DataType::Float64 {
+                        let v1 = l
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or("not a valid float64 column")?;
+
+                        let v2 = r
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or("not a valid float64 column")?;
+
+                        compare_column(column, v1, v2);
+                    } else if *d1 == DataType::UInt64 {
+                        let v1 = l
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or("not a valid float64 column")?;
+
+                        let v2 = r
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or("not a valid float64 column")?;
+
+                        compare_column(column, v1, v2);
+                    } else if *d1 == DataType::Int64 {
+                        let v1 = l
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or("not a valid float64 column")?;
+
+                        let v2 = r
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or("not a valid float64 column")?;
+
+                        compare_column(column, v1, v2);
+                    } else {
+                        eprintln!("Skipping histogram column: {}", column);
+                    }
+                }
+
+                // Display columns only in the right
+                for (idx, _) in y.columns().iter().enumerate() {
+                    let column = s2.field(idx).name();
+                    if x.column_by_name(column).is_none() {
+                        eprintln!("{column} missing in {left}");
+                    }
+                }
+            }
+
+            // Fill in data in case right has more record batches
+            if r2.next().is_some() {
+                let e = format!("{} iterator completed earlier", left);
+                return Err(e.into());
+            }
+        }
+        Commands::Validate { input } => {
+            let (_, schema, reader) = read_parquet_footer(&input)?;
+
+            for batch in reader {
+                let batch = batch?;
+                for (idx, col) in batch.columns().iter().enumerate() {
+                    let f = schema.field(idx);
+                    let n = f.name();
+
+                    if f.metadata().get("metric_type") != Some(&"delta_counter".to_string()) {
+                        continue;
+                    }
+
+                    if *f.data_type() != DataType::Float64 {
+                        let e = format!("Invalid data type for {}: {}", n, f.data_type());
+                        return Err(e.into());
+                    }
+
+                    let values = col
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or("failed to downcast to float64 array")?;
+
+                    for (i, v) in values.iter().enumerate() {
+                        if let Some(x) = v {
+                            if x < 0.0 {
+                                eprintln!("Negative value found in {}, row {}", n, i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Commands::Cgroup {
+            input,
+            metadata,
+            output,
+            tag_1,
+            tag_2,
+        } => {
+            #[derive(Debug, Serialize, Deserialize)]
+            struct Record {
+                cgroup: String,
+                tag_1: String,
+                tag_2: String,
+            }
+
+            let mut mappings: Vec<Record> = Vec::new();
+            let mut names = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_path(metadata)?;
+            for record in names.deserialize() {
+                let data: Record = record.unwrap();
+                mappings.push(data);
+            }
+
+            let t1 = tag_1.unwrap_or("tag_1".to_string());
+            let t2 = tag_2.unwrap_or("tag_2".to_string());
+
+            let (metadata, schema, reader) = read_parquet_footer(&input)?;
+
+            // Merge field metadata from schema and mappings file
+            let mut fields: Vec<Field> = Vec::new();
+            for field in schema.fields() {
+                let mut f = (*(*field).clone()).clone();
+                let meta = field.metadata();
+
+                // Add to the metadata is the metric is of type cgroup
+                // and the name contains part of the cgroup name in the
+                // external mappings file. This assumes that there will
+                // only be a single match for each cgroup.
+                if let Some(metric) = meta.get("metric") {
+                    if metric.starts_with("cgroup") {
+                        if let Some(name) = meta.get("name") {
+                            for r in &mappings {
+                                if name.contains(&r.cgroup) {
+                                    let mut nmeta = meta.clone();
+                                    nmeta.insert(t1.clone(), r.tag_1.clone());
+                                    nmeta.insert(t2.clone(), r.tag_2.clone());
+                                    f = f.with_metadata(nmeta);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                fields.push(f);
+            }
+            let nschema = Arc::new(Schema::new(fields));
+
+            let props = WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(8)?))
+                .set_key_value_metadata(metadata.file_metadata().key_value_metadata().cloned())
+                .set_max_row_group_size(metadata.row_group(0).num_rows() as usize)
+                .build();
+            let mut writer =
+                ArrowWriter::try_new(File::create_new(&output)?, nschema.clone(), Some(props))?;
+            for batch in reader {
+                let merged_batch =
+                    RecordBatch::try_new(nschema.clone(), batch?.columns().to_vec())?;
+                writer.write(&merged_batch)?;
+            }
+            writer.finish()?;
+        }
     }
 
-    return (strings, nums, floats, lists, arrays);
-}
-
-fn generate_batch(nrows: u8, list: bool, array: bool) -> RecordBatch {
-    let mut pq_cols: Vec<Field> = Vec::new();
-    let mut pq_series: Vec<Arc<dyn Array>> = Vec::new();
-
-    let (strings, nums, floats, lists, arrays) = generate_data(nrows);
-
-    build_u64_column("nums", nums, &mut pq_cols, &mut pq_series);
-    build_f64_column("floats", floats, &mut pq_cols, &mut pq_series);
-    build_string_column("strings", strings, &mut pq_cols, &mut pq_series);
-    if list {
-        build_u64_list_column("lists", lists, &mut pq_cols, &mut pq_series);
-    }
-    if array {
-        build_u64_array_column("arrays", arrays, &mut pq_cols, &mut pq_series);
-    }
-
-    let schema = Schema::new(pq_cols);
-    let batch = RecordBatch::try_new(Arc::new(schema), pq_series).unwrap();
-
-    return batch;
-}
-
-fn build_arrow(output: &str, nrows: u8, compression: bool, list: bool, array: bool) {
-    let batch = generate_batch(nrows, list, array);
-    write_parquet(
-        output.to_owned() + ".parquet",
-        list,
-        array,
-        compression,
-        batch.schema(),
-        nrows,
-        2,
-    );
-}
-
-fn read_parquet_batch(input: &str) -> RecordBatch {
-    let file = File::open(input).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-    let mut reader = builder.build().unwrap();
-    let record_batch = reader.next().unwrap().unwrap();
-    return record_batch;
-}
-
-fn read_parquet(input: &str) {
-    let name = input.to_owned() + ".parquet";
-    let record_batch = read_parquet_batch(&name);
-    for i in 0..record_batch.num_columns() {
-        let col = &record_batch.columns()[i];
-        println!("Column {}: {:#?}", i, col);
-    }
-}
-
-fn read_parquet_schema(input: &str) -> SchemaRef {
-    let file = File::open(input).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-    return builder.schema().clone();
-}
-
-fn read_ipc_schema(input: &str) -> SchemaRef {
-    let reader = FileReader::try_new(File::open(input).unwrap(), None).unwrap();
-    return reader.schema();
-}
-
-fn read_parquet_metadata(input: &str) -> Arc<ParquetMetaData> {
-    let file = File::open(input).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-    return builder.metadata().clone();
-}
-
-fn read_ipc_metadata(input: &str) -> HashMap<String, String> {
-    let reader = FileReader::try_new(File::open(input).unwrap(), None).unwrap();
-    return reader.custom_metadata().clone();
+    return Ok(());
 }
 
 fn main() {
     let args = CliArgs::parse();
 
-    match &args.command {
-        Commands::Generate {
-            compression,
-            list,
-            array,
-            keepfile,
-        } => {
-            let name = "foobar";
-            build_arrow(name, 3, *compression, *list, *array);
-            read_parquet(name);
-
-            if !keepfile {
-                let _ = std::fs::remove_file(name.to_owned() + ".parquet");
-            }
-        }
-        Commands::Schema {
-            input_file,
-            filter,
-            tag_filter,
-            output_file,
-        } => {
-            let schema = match input_file.ends_with(".parquet") {
-                true => read_parquet_schema(input_file),
-                false => read_ipc_schema(input_file),
-            };
-            let tf = tag_filter.unwrap_or_default();
-            for f in schema.fields() {
-                if let Some(x) = filter {
-                    let name = if tf {
-                        f.metadata().get("metric").cloned().unwrap_or_default()
-                    } else {
-                        f.name().clone()
-                    };
-
-                    if !name.starts_with(x) {
-                        continue;
-                    }
-                }
-                println!("{}. {:#?}, {:#?}", f.name(), f.data_type(), f.metadata());
-            }
-
-            if let Some(op_file) = output_file {
-                println!("Writing schema to {}", &op_file);
-                let cloned = (*schema).clone();
-                let json = serde_json::to_string(&cloned).unwrap();
-                if let Err(e) = std::fs::write(op_file, json) {
-                    println!("Error writing schema: {}", e);
-                }
-            }
-        }
-        Commands::Metadata { input_file } => {
-            match input_file.ends_with(".parquet") {
-                true => {
-                    let x = read_parquet_metadata(input_file);
-                    let m: Vec<_> = x
-                        .file_metadata()
-                        .key_value_metadata()
-                        .unwrap()
-                        .iter()
-                        .filter(|x| !x.key.starts_with("ARROW"))
-                        .collect();
-                    println!("{:#?}", m);
-                    println!("Num of row groups: {}", x.row_groups().len());
-                    println!("Row group: {:#?}", x.row_group(0).num_rows());
-                }
-                false => {
-                    let x = read_ipc_metadata(input_file);
-                    println!("{:#?}", x);
-                }
-            };
-        }
-        Commands::Convert {
-            input_file,
-            compression,
-        } => {
-            let output = input_file.to_owned() + ".arrow";
-            let batch = read_parquet_batch(input_file);
-            write_ipc(output, *compression, &batch);
-        }
-        Commands::Add { input_file } => {
-            let output = "/home/mihirn/Downloads/foo_meta.parquet";
-            let schema = read_parquet_schema(input_file);
-            let batch = read_parquet_batch(input_file);
-            let metadata: HashMap<&str, &str> = [
-                ("grouping_power", "3"),
-                ("max_value_power", "64"),
-                ("op", "read"),
-                ("metric", "syscall_latency"),
-                ("unit", "nanoseconds"),
-                ("metric_type", "histogram"),
-            ]
-            .into();
-            let m2: HashMap<String, String> = metadata
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-
-            let nf = schema.field(0).clone().with_metadata(m2);
-            let s = Schema::new(vec![nf]);
-            dbg!("{}", &s);
-
-            let file = File::create(output).unwrap();
-            let props = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
-                .build();
-
-            let mut writer = ArrowWriter::try_new(file, Arc::new(s), Some(props)).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        }
-        Commands::Validate { input_file } => {
-            let file = File::open(input_file).unwrap();
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-            let schema = builder.schema().clone();
-            let counters: BTreeSet<String> = schema
-                .fields()
-                .iter()
-                .filter(|f| f.metadata().get("metric_type") == Some(&"delta_counter".to_string()))
-                .map(|f| f.name().clone())
-                .collect();
-
-            let reader = builder.build().unwrap();
-            reader.for_each(|batch| match batch {
-                Ok(b) => {
-                    b.columns().iter().zip(schema.fields()).for_each(|(c, f)| {
-                        if counters.contains(f.name()) {
-                            if *c.data_type() != DataType::Float64 {
-                                eprintln!("Invalid data type for {}", f.name());
-                                exit(-1);
-                            }
-
-                            let values = c
-                                .as_any()
-                                .downcast_ref::<Float64Array>()
-                                .expect("Failed to downcast");
-
-                            for (i, v) in values.iter().enumerate() {
-                                if let Some(x) = v {
-                                    if x < 0.0 {
-                                        eprintln!(
-                                            "Negative value found in {}, row {}",
-                                            f.name(),
-                                            i
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Error reading batch: {}", &e);
-                }
-            });
-        }
-        Commands::Compare {
-            left,
-            right,
-            column,
-        } => {
-            let f1 = File::open(left).unwrap();
-            let f2 = File::open(right).unwrap();
-            let b1 = ParquetRecordBatchReaderBuilder::try_new(f1).unwrap();
-            let b2 = ParquetRecordBatchReaderBuilder::try_new(f2).unwrap();
-
-            if b1.schema().field_with_name(column).is_err() {
-                eprintln!("Column {} does not exist in {}", column, left);
-                exit(-1);
-            }
-
-            if b2.schema().field_with_name(column).is_err() {
-                eprintln!("Column {} does not exist in {}", column, left);
-                exit(-1);
-            }
-
-            let r1 = b1.build().unwrap();
-            let r2 = b2.build().unwrap();
-            r1.into_iter().zip(r2).for_each(|(x, y)| {
-                if x.is_err() {
-                    eprintln!(
-                        "Error reading next recordbatch from {}: {}",
-                        left,
-                        x.unwrap_err()
-                    );
-                    exit(-1);
-                }
-
-                if y.is_err() {
-                    eprintln!(
-                        "Error reading next recordbatch from {}: {}",
-                        right,
-                        y.unwrap_err()
-                    );
-                    exit(-1);
-                }
-
-                let (x, y) = (x.unwrap(), y.unwrap());
-                let l = x.column_by_name(column).unwrap();
-                let r = y.column_by_name(column).unwrap();
-
-                if *l.data_type() != *r.data_type() {
-                    eprintln!(
-                        "Data type mismatch: {} and {}",
-                        *l.data_type(),
-                        *r.data_type()
-                    );
-                    exit(-1);
-                }
-
-                let v1 = l
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .expect("Failed to downcast");
-
-                let v2 = r
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .expect("Failed to downcast");
-
-                v1.into_iter().zip(v2).enumerate().for_each(|(i, (x, y))| {
-                    if x != y {
-                        eprintln!("Values mismatch for row {}: {:#?} vs {:#?}", i, x, y);
-                    }
-                });
-            });
-        }
-        Commands::Cgroup {
-            input_file,
-            name_file,
-        } => {
-            #[derive(Debug, Serialize, Deserialize)]
-            struct Record {
-                cgroup: String,
-                id_1: String,
-                id_2: String,
-            }
-
-            let mut mappings: Vec<Record> = Vec::new();
-            let mut names = csv::Reader::from_path(name_file).unwrap();
-            for record in names.deserialize() {
-                let data: Record = record.unwrap();
-                mappings.push(data);
-            }
-            // dbg!("{}", &mappings);
-
-            let file = File::open(input_file).unwrap();
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-            let schema = builder.schema().clone();
-            let mut fields: Vec<Field> = Vec::new();
-
-            for f in schema.fields() {
-                let mut cf = (*(*f).clone()).clone();
-                let meta = cf.metadata();
-
-                let Some(metric) = meta.get("metric") else {
-                    fields.push(cf);
-                    continue;
-                };
-
-                if !metric.starts_with("cgroup") {
-                    fields.push(cf);
-                    continue;
-                }
-
-                let Some(name) = meta.get("name") else {
-                    fields.push(cf);
-                    continue;
-                };
-
-                for r in &mappings {
-                    // Assume only a single match
-                    if name.contains(&r.cgroup) {
-                        let mut nm = meta.clone();
-                        nm.insert("id_1".to_string(), r.id_1.clone());
-                        nm.insert("id_2".to_string(), r.id_2.clone());
-                        cf = cf.with_metadata(nm);
-                        fields.push(cf);
-                        break;
-                    }
-                }
-            }
-
-            // Build new schema
-            let mut builder = SchemaBuilder::new();
-            let meta = builder.metadata_mut();
-            schema.metadata().iter().for_each(|(k, v)| {
-                meta.insert(k.to_string(), v.to_string());
-            });
-            fields.into_iter().for_each(|f| builder.push(f));
-            let s = builder.finish();
-
-            let op_file = "mod_meta.json";
-            println!("Writing schema to {}", &op_file);
-            let json = serde_json::to_string(&s).unwrap();
-            if let Err(e) = std::fs::write(op_file, json) {
-                println!("Error writing schema: {}", e);
-            }
-        }
+    if let Err(e) = run(args.command) {
+        eprintln!("Error: {e}");
     }
 }
