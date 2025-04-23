@@ -1,6 +1,9 @@
 #![allow(clippy::needless_return)]
 
-use arrow_array::{Float64Array, Int64Array, PrimitiveArray, RecordBatch, UInt64Array};
+use arrow_array::{
+    Float64Array, GenericListArray, Int64Array, ListArray, PrimitiveArray, RecordBatch,
+    UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::{Parser, Subcommand};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
@@ -123,13 +126,19 @@ fn compare_fields(x: &Field, y: &Field) {
 
 fn compare_column<T: arrow_array::ArrowPrimitiveType>(
     column: &str,
-    v1: &PrimitiveArray<T>,
-    v2: &PrimitiveArray<T>,
-) where
+    x: Option<&PrimitiveArray<T>>,
+    y: Option<&PrimitiveArray<T>>,
+    row_idx: Option<usize>,
+) -> Result<(), Box<dyn Error>>
+where
     <T as arrow_array::ArrowPrimitiveType>::Native: std::fmt::Display,
 {
-    v1.into_iter().zip(v2).enumerate().for_each(|(i, (x, y))| {
-        if x != y {
+    let v1 = x.ok_or("invalid downcast for column")?;
+    let v2 = y.ok_or("invalid downcast for column")?;
+
+    v1.into_iter().zip(v2).enumerate().for_each(|(i, (a, b))| {
+        if a != b {
+            let row = row_idx.unwrap_or(i);
             let x_str = x
                 .map(|_| v1.value(i).to_string())
                 .unwrap_or("None".to_string());
@@ -138,10 +147,46 @@ fn compare_column<T: arrow_array::ArrowPrimitiveType>(
                 .unwrap_or("None".to_string());
             eprintln!(
                 "Values mismatch for {column}; row {}: {} vs {}",
-                i, x_str, y_str
+                row, x_str, y_str
             );
         }
     });
+
+    return Ok(());
+}
+
+fn compare_listarray_column(
+    column: &str,
+    v1: &GenericListArray<i32>,
+    v2: &GenericListArray<i32>,
+    data_type: &DataType,
+) -> Result<(), Box<dyn Error>> {
+    for (idx, (x, y)) in v1.iter().zip(v2.iter()).enumerate() {
+        if (x.is_none() && y.is_some()) || (x.is_some() && y.is_none()) {
+            eprintln!("Values mismatch for {column}; row {idx}, only one is None");
+            continue;
+        }
+
+        if let (Some(a), Some(b)) = (x, y) {
+            match data_type {
+                DataType::UInt32 => {
+                    let l = a.as_any().downcast_ref::<UInt32Array>();
+                    let r = b.as_any().downcast_ref::<UInt32Array>();
+                    compare_column(column, l, r, Some(idx))?;
+                }
+                DataType::UInt64 => {
+                    let l = a.as_any().downcast_ref::<UInt64Array>();
+                    let r = b.as_any().downcast_ref::<UInt64Array>();
+                    compare_column(column, l, r, Some(idx))?;
+                }
+                _ => {
+                    eprintln!("Unexpected inner data type for {column}: {data_type}");
+                }
+            };
+        }
+    }
+
+    return Ok(());
 }
 
 fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
@@ -251,45 +296,41 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
                         return Err(e.into());
                     }
 
-                    if *d1 == DataType::Float64 {
-                        let v1 = l
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .ok_or("not a valid float64 column")?;
-
-                        let v2 = r
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .ok_or("not a valid float64 column")?;
-
-                        compare_column(column, v1, v2);
-                    } else if *d1 == DataType::UInt64 {
-                        let v1 = l
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or("not a valid float64 column")?;
-
-                        let v2 = r
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or("not a valid float64 column")?;
-
-                        compare_column(column, v1, v2);
-                    } else if *d1 == DataType::Int64 {
-                        let v1 = l
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .ok_or("not a valid float64 column")?;
-
-                        let v2 = r
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .ok_or("not a valid float64 column")?;
-
-                        compare_column(column, v1, v2);
-                    } else {
-                        eprintln!("Skipping histogram column: {}", column);
-                    }
+                    let (l_any, r_any) = (l.as_any(), r.as_any());
+                    match d1 {
+                        DataType::UInt32 => {
+                            let v1 = l_any.downcast_ref::<UInt32Array>();
+                            let v2 = r_any.downcast_ref::<UInt32Array>();
+                            compare_column(column, v1, v2, None)?;
+                        }
+                        DataType::UInt64 => {
+                            let v1 = l_any.downcast_ref::<UInt64Array>();
+                            let v2 = r_any.downcast_ref::<UInt64Array>();
+                            compare_column(column, v1, v2, None)?;
+                        }
+                        DataType::Int64 => {
+                            let v1 = l_any.downcast_ref::<Int64Array>();
+                            let v2 = r_any.downcast_ref::<Int64Array>();
+                            compare_column(column, v1, v2, None)?;
+                        }
+                        DataType::Float64 => {
+                            let v1 = l_any.downcast_ref::<Float64Array>();
+                            let v2 = r_any.downcast_ref::<Float64Array>();
+                            compare_column(column, v1, v2, None)?;
+                        }
+                        DataType::List(field_type) => {
+                            let v1 = l_any
+                                .downcast_ref::<ListArray>()
+                                .ok_or("not a list array")?;
+                            let v2 = r_any
+                                .downcast_ref::<ListArray>()
+                                .ok_or("not a list array")?;
+                            compare_listarray_column(column, v1, v2, field_type.data_type())?;
+                        }
+                        _ => {
+                            eprintln!("Unexpected type for {column}: {}", d1);
+                        }
+                    };
                 }
 
                 // Display columns only in the right
