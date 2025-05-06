@@ -6,17 +6,59 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::{Parser, Subcommand};
+use core::fmt;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::ZstdLevel;
 use parquet::file::metadata::KeyValue;
 use parquet::file::{metadata::ParquetMetaData, properties::WriterProperties};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+
+struct MetricsMap {
+    pub(crate) data: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+}
+
+impl MetricsMap {
+    pub fn new() -> Self {
+        return Self {
+            data: BTreeMap::new(),
+        };
+    }
+}
+
+impl fmt::Display for MetricsMap {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "METRICS ({})\n----------\n", self.data.len())?;
+        for (metric, metadata) in &self.data {
+            write!(f, "{}\n", metric)?;
+            for (k, v) in metadata {
+                let x: String = v
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                write!(f, "\t{}: {}\n", k, x)?;
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+const IGNORED_METRICS_METADATA: &[&str] = &[
+    "metric",
+    "metric_type",
+    "name",
+    "id",
+    "grouping_power",
+    "max_value_power",
+    "unit",
+];
 
 #[derive(Subcommand)]
 enum Commands {
@@ -78,6 +120,14 @@ enum Commands {
 
         #[arg(short, long)]
         output: String,
+    },
+    /// List of cgroups and all cgroup-associated metrics in the file
+    CgroupsInfo {
+        #[arg(short, long)]
+        input: String,
+
+        #[arg(short, long, default_value_t = false)]
+        numeric_only: bool,
     },
 }
 
@@ -202,6 +252,37 @@ fn compare_listarray_column(
     }
 
     return Ok(());
+}
+
+fn get_cgroups(schema: &SchemaRef) -> (Vec<String>, MetricsMap) {
+    let mut cgroups: BTreeSet<String> = BTreeSet::new();
+    let mut metrics: MetricsMap = MetricsMap::new();
+
+    let ignored_metadata: BTreeSet<String> = IGNORED_METRICS_METADATA
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    schema.fields().iter().for_each(|f| {
+        let metadata = f.metadata();
+        if let Some(metric) = metadata.get("metric") {
+            if metric.starts_with("cgroup") {
+                if let Some(name) = metadata.get("name") {
+                    cgroups.insert(name.to_string());
+                }
+
+                let e = metrics.data.entry(metric.to_string()).or_default();
+                for (k, v) in metadata {
+                    if ignored_metadata.contains(k) {
+                        continue;
+                    }
+                    e.entry(k.to_string()).or_default().insert(v.to_string());
+                }
+            }
+        }
+    });
+
+    return (cgroups.into_iter().collect(), metrics);
 }
 
 fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
@@ -597,6 +678,21 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
             let batch = RecordBatch::try_new(schema, data)?;
             writer.write(&batch)?;
             writer.finish()?;
+        }
+        Commands::CgroupsInfo {
+            input,
+            numeric_only,
+        } => {
+            let (_, schema, _) = read_parquet_footer(&input)?;
+            let (cgroups, metrics) = get_cgroups(&schema);
+            if numeric_only {
+                eprintln!("Number of cgroups: {}", cgroups.len());
+                eprintln!("Number of metrics: {}", metrics.data.len());
+            } else {
+                eprintln!("CGROUPS ({})\n----------", cgroups.len());
+                cgroups.iter().for_each(|s| eprintln!("{s}"));
+                eprintln!("\n{}", &metrics);
+            }
         }
     }
 
