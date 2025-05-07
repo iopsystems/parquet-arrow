@@ -11,13 +11,13 @@ Displays the Arrow schema, including metadata, for the file.
 Usage: parquet-arrow <COMMAND>
 
 Commands:
-  schema          Schema and metadata for the parquet file
-  row-group-info  Row group information: number and size of row groups
-  compare-schema  Compare parquet schemas
-  compare         Compare parquet data
-  validate        Validate delta counters in a postprocessd parquet file
-  cgroup          Augment file with additional metadata around cgroups
-  help            Print this message or the help of the given subcommand(s)
+  schema               Schema and metadata for the parquet file
+  row-group-info       Row group information: number and size of row groups
+  compare-schema       Compare parquet schemas
+  compare              Compare parquet data
+  validate             Validate delta counters in a postprocessd parquet file
+  add-cgroup-metadata  Augment file with additional metadata around cgroups
+  help                 Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -55,19 +55,15 @@ that the columns are either `int64`, `uint64`, or `double` values.
 Checks if there are any negative values in columns with type `delta_counter`.
 This operates on postprocessed artifacts.
 
-## Cgroup
+## AddCgroupMetadata
 Augments information about cgroups in the parquet file with additional data
 from an external metadata file. The external metadata file is a CSV file
-of the format: `<CGROUP_PATTERN>, <TAG_1>, <TAG_2>`, where the tags can have
-any arbitrary name or data.
+of the format: `<CGROUP_PATTERN>, <TAG_1>, <TAG_2>, .. <TAG_N>`, where the tags
+can have any arbitrary name or data. An example of such a CSV file is at
+`examples/add-cgroup-metadata.csv`.
 
 The parquet file is parsed and any cgroup metric which has the pattern in its
-name has the tags added to its metadata. By default, the data from the tags
-is added with the keys `tag_1` and `tag_2`, but these can be customized with
-the `--tag` parameter. To add tags with keys `red` and `rouge`:
-```sh
-  parquet-arrow cgroup -i <PARQUET> -m <CSV> --tag-1=red --tag-2=rouge
-```
-
-It is assumed that each cgroup metric matches only a single pattern from the
-additional mappings file. If it matches multiple patterns, the first one wins.
+name has the tags added to its metadata. The tag names are automatically
+derived from the CSV header. It is assumed that each cgroup metric matches only
+a single pattern from the additional mappings file. If it matches multiple
+patterns, the first one wins.

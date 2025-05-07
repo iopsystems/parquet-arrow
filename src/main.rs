@@ -10,7 +10,7 @@ use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchR
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::ZstdLevel;
 use parquet::file::{metadata::ParquetMetaData, properties::WriterProperties};
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
@@ -56,7 +56,7 @@ enum Commands {
         input: String,
     },
     /// Augment file with additional metadata around cgroups
-    Cgroup {
+    AddCgroupMetadata {
         #[arg(short, long)]
         input: String,
 
@@ -65,12 +65,6 @@ enum Commands {
 
         #[arg(short, long)]
         output: String,
-
-        #[arg(long)]
-        tag_1: Option<String>,
-
-        #[arg(long)]
-        tag_2: Option<String>,
     },
 }
 
@@ -381,31 +375,19 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Commands::Cgroup {
+        Commands::AddCgroupMetadata {
             input,
             metadata,
             output,
-            tag_1,
-            tag_2,
         } => {
-            #[derive(Debug, Serialize, Deserialize)]
-            struct Record {
-                cgroup: String,
-                tag_1: String,
-                tag_2: String,
-            }
+            type Record = HashMap<String, String>;
 
             let mut mappings: Vec<Record> = Vec::new();
-            let mut names = csv::ReaderBuilder::new()
-                .has_headers(false)
-                .from_path(metadata)?;
+            let mut names = csv::ReaderBuilder::new().from_path(metadata)?;
             for record in names.deserialize() {
                 let data: Record = record.unwrap();
                 mappings.push(data);
             }
-
-            let t1 = tag_1.unwrap_or("tag_1".to_string());
-            let t2 = tag_2.unwrap_or("tag_2".to_string());
 
             let (metadata, schema, reader) = read_parquet_footer(&input)?;
 
@@ -423,12 +405,20 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
                     if metric.starts_with("cgroup") {
                         if let Some(name) = meta.get("name") {
                             for r in &mappings {
-                                if name.contains(&r.cgroup) {
-                                    let mut nmeta = meta.clone();
-                                    nmeta.insert(t1.clone(), r.tag_1.clone());
-                                    nmeta.insert(t2.clone(), r.tag_2.clone());
-                                    f = f.with_metadata(nmeta);
-                                    break;
+                                if let Some(cgroup) = r.get("cgroup") {
+                                    if name.contains(cgroup) {
+                                        let mut nmeta = meta.clone();
+
+                                        for (k, v) in r {
+                                            if k == "cgroup" {
+                                                continue;
+                                            }
+                                            nmeta.insert(k.to_string(), v.to_string());
+                                        }
+
+                                        f = f.with_metadata(nmeta);
+                                        break;
+                                    }
                                 }
                             }
                         }
