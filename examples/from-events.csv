@@ -1,0 +1,4 @@
+ts,id1,id2,name,metric1,metric2,type
+2025-03-21T21:09:11.457Z,0,1,foobar,12,17.6,pong
+2025-03-21T21:19:11.457Z,0,11,foobar,18,117.6,ping
+2025-03-21T21:29:11.492Z,0,11,foobar,61,7.6,ping

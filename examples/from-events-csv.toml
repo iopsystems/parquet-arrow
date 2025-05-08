@@ -1,0 +1,24 @@
+# Name of the field with the timestamp
+ts = "ts"
+
+# List of columns used to identify the instance associated with an event.
+# Stored as strings and collectively treated as a discriminator for stacked
+# data from different sources.
+discriminator = [
+	"id1",
+	"id2",
+	"name",
+]
+
+# List of metrics to store for each event (stored as double values)
+metrics = [
+	"metric1",
+	"metric2",
+]
+
+# Event log filtering criteria. If specified, any entries that do not have
+# the key as a field, or have the key, but the value does not match are
+# eliminated. If multiple filter criteria are specified, only one needs
+# to match for an entry to be considered valid.
+[filter]
+type = "ping"

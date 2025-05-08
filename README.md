@@ -17,6 +17,7 @@ Commands:
   compare              Compare parquet data
   validate             Validate delta counters in a postprocessd parquet file
   add-cgroup-metadata  Augment file with additional metadata around cgroups
+  from-event-csv       Convert an event-log CSV to a parquet file
   help                 Print this message or the help of the given subcommand(s)
 
 Options:
@@ -67,3 +68,18 @@ name has the tags added to its metadata. The tag names are automatically
 derived from the CSV header. It is assumed that each cgroup metric matches only
 a single pattern from the additional mappings file. If it matches multiple
 patterns, the first one wins.
+
+## FromEventCSV
+Converts an event log in a CSV file to a parquet. The process is controlled by
+a configuration file, an example of which is in `examples/from-event-csv.toml`.
+The configuration file specifies the name for the timestamp field in the CSV,
+along with the fields which act to uniquely identify an instance that the data
+is associated with (the discriminators), and the metrics to extract and store
+for each instance. Event logs are filtered if a filtering criteria is provided.
+
+The output parquet file contains a row per (timestamp, instance/discriminators)
+with the values for all the metrics associated with the instance at that
+timestamp. The file is not ordered on the basis of either timestamp or the
+instance, however, entries for a single instance should be ordered by timestamp.
+The end output is similar to stacked files from different Rezolus instances,
+except with potentially multiple instance fields.

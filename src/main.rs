@@ -1,16 +1,18 @@
 #![allow(clippy::needless_return)]
 
 use arrow_array::{
-    Float64Array, GenericListArray, Int64Array, ListArray, PrimitiveArray, RecordBatch,
-    UInt32Array, UInt64Array,
+    Array, Float64Array, GenericListArray, Int64Array, ListArray, PrimitiveArray, RecordBatch,
+    StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::{Parser, Subcommand};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::ZstdLevel;
+use parquet::file::metadata::KeyValue;
 use parquet::file::{metadata::ParquetMetaData, properties::WriterProperties};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
@@ -66,12 +68,31 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// Convert an event-log CSV to a parquet file
+    FromEventCSV {
+        #[arg(short, long)]
+        input: String,
+
+        #[arg(short, long)]
+        config: String,
+
+        #[arg(short, long)]
+        output: String,
+    },
 }
 
 #[derive(Parser)]
 struct CliArgs {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FromEventCSVConfig {
+    ts: String,
+    discriminator: Vec<String>,
+    metrics: Vec<String>,
+    filter: Option<HashMap<String, String>>,
 }
 
 fn read_parquet_footer(
@@ -385,7 +406,7 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
             let mut mappings: Vec<Record> = Vec::new();
             let mut names = csv::ReaderBuilder::new().from_path(metadata)?;
             for record in names.deserialize() {
-                let data: Record = record.unwrap();
+                let data: Record = record?;
                 mappings.push(data);
             }
 
@@ -441,6 +462,140 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
                     RecordBatch::try_new(nschema.clone(), batch?.columns().to_vec())?;
                 writer.write(&merged_batch)?;
             }
+            writer.finish()?;
+        }
+        Commands::FromEventCSV {
+            input,
+            config,
+            output,
+        } => {
+            type Record = HashMap<String, String>;
+
+            let data = std::fs::read_to_string(&config)?;
+            let toml: FromEventCSVConfig = toml::from_str(&data)?;
+
+            // Create in-memory vectors to store the event data as columns.
+            // This assumes that all the data can be stored in memory and the
+            // file does not have to be streamed to a parquet.
+            let mut tses = Vec::new();
+            let mut ts_nses = Vec::new();
+            let mut discriminators: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+            let mut metrics: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
+
+            for d in &toml.discriminator {
+                discriminators.insert(d.to_string(), Vec::new());
+            }
+
+            for m in &toml.metrics {
+                metrics.insert(m.to_string(), Vec::new());
+            }
+
+            let mut event_log = csv::ReaderBuilder::new().from_path(input)?;
+            for record in event_log.deserialize() {
+                let data: Record = record?;
+
+                // If a filtering criteria exists for the log events, apply it
+                if let Some(filter) = &toml.filter {
+                    let mut skip: bool = true;
+                    for (k, v) in filter {
+                        if data.get(k) == Some(v) {
+                            skip = false;
+                            break;
+                        }
+                    }
+                    if skip {
+                        continue;
+                    }
+                }
+
+                // Extract and store the timestamp for the current event
+                let Some(str_ts) = data.get(&toml.ts) else {
+                    return Err("timestamp missing".into());
+                };
+                let ts = chrono::DateTime::parse_from_rfc3339(str_ts)?;
+                let ts_ns = ts
+                    .timestamp_nanos_opt()
+                    .ok_or("timestamp cannot be converted to nanoseconds")?
+                    as u64;
+                tses.push(ts.to_string());
+                ts_nses.push(ts_ns);
+
+                // Get all discriminator fields for the current event. If
+                // a field is missing, None is stored.
+                for d in &toml.discriminator {
+                    let Some(e) = discriminators.get_mut(d) else {
+                        return Err(format!("{} field missing", d).into());
+                    };
+                    e.push(data.get(d).cloned());
+                }
+
+                // Get all the configured metrics for the current event. If
+                // a field is missing, None is stored.
+                for m in &toml.metrics {
+                    let Some(e) = metrics.get_mut(m) else {
+                        return Err(format!("{} field missing", m).into());
+                    };
+                    let v: Option<f64> = if let Some(x) = data.get(m) {
+                        Some(x.parse()?)
+                    } else {
+                        None
+                    };
+                    e.push(v);
+                }
+            }
+
+            // Build schema from timestamps, discriminators, and metrics
+            let mut fields: Vec<Field> =
+                Vec::with_capacity(2 + discriminators.len() + metrics.len());
+            let ts_name = "timestamp_rfc3339";
+            let mut columns = vec![
+                (ts_name.to_string(), DataType::Utf8, false, ts_name),
+                (
+                    "timestamp".to_string(),
+                    DataType::UInt64,
+                    false,
+                    "timestamp",
+                ),
+            ];
+            let mut data: Vec<Arc<dyn Array>> = vec![
+                Arc::new(StringArray::from(tses)),
+                Arc::new(UInt64Array::from(ts_nses)),
+            ];
+            for (k, v) in discriminators.into_iter() {
+                columns.push((k, DataType::Utf8, true, "discriminator"));
+                data.push(Arc::new(StringArray::from(v)));
+            }
+            for (k, v) in metrics.into_iter() {
+                columns.push((k, DataType::Float64, true, "gauge"));
+                data.push(Arc::new(Float64Array::from(v)));
+            }
+
+            for (name, dt, nullable, metric_type) in columns {
+                fields.push(
+                    Field::new(name.to_string(), dt, nullable).with_metadata(
+                        [
+                            ("metric".to_string(), name.to_string()),
+                            ("metric_type".to_string(), metric_type.to_string()),
+                        ]
+                        .into(),
+                    ),
+                );
+            }
+            let schema = Arc::new(Schema::new(fields));
+
+            // Store discriminators as file metadata and write out the parquet
+            let metadata: Vec<KeyValue> = vec![KeyValue {
+                key: "discriminator".to_string(),
+                value: Some(toml.discriminator.join(", ")),
+            }];
+            let props = WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(8)?))
+                .set_key_value_metadata(Some(metadata))
+                .build();
+            let mut writer =
+                ArrowWriter::try_new(File::create_new(&output)?, schema.clone(), Some(props))?;
+            let batch = RecordBatch::try_new(schema, data)?;
+            writer.write(&batch)?;
             writer.finish()?;
         }
     }
