@@ -477,7 +477,6 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
             // Create in-memory vectors to store the event data as columns.
             // This assumes that all the data can be stored in memory and the
             // file does not have to be streamed to a parquet.
-            let mut tses = Vec::new();
             let mut ts_nses = Vec::new();
             let mut discriminators: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
             let mut metrics: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
@@ -517,7 +516,6 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
                     .timestamp_nanos_opt()
                     .ok_or("timestamp cannot be converted to nanoseconds")?
                     as u64;
-                tses.push(ts.to_string());
                 ts_nses.push(ts_ns);
 
                 // Get all discriminator fields for the current event. If
@@ -546,21 +544,14 @@ fn run(cmd: Commands) -> Result<(), Box<dyn Error>> {
 
             // Build schema from timestamps, discriminators, and metrics
             let mut fields: Vec<Field> =
-                Vec::with_capacity(2 + discriminators.len() + metrics.len());
-            let ts_name = "timestamp_rfc3339";
-            let mut columns = vec![
-                (ts_name.to_string(), DataType::Utf8, false, ts_name),
-                (
-                    "timestamp".to_string(),
-                    DataType::UInt64,
-                    false,
-                    "timestamp",
-                ),
-            ];
-            let mut data: Vec<Arc<dyn Array>> = vec![
-                Arc::new(StringArray::from(tses)),
-                Arc::new(UInt64Array::from(ts_nses)),
-            ];
+                Vec::with_capacity(1 + discriminators.len() + metrics.len());
+            let mut columns = vec![(
+                "timestamp".to_string(),
+                DataType::UInt64,
+                false,
+                "timestamp",
+            )];
+            let mut data: Vec<Arc<dyn Array>> = vec![Arc::new(UInt64Array::from(ts_nses))];
             for (k, v) in discriminators.into_iter() {
                 columns.push((k, DataType::Utf8, true, "discriminator"));
                 data.push(Arc::new(StringArray::from(v)));
